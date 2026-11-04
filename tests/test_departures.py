@@ -8,12 +8,15 @@ Fixture reminder (tests/fixtures/mini_gtfs/README.md):
 Dates used: Mon 2026-11-09, Fri 2026-11-13, Sat 2026-11-14.
 """
 
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from adelaide_metro_mcp import db
 from adelaide_metro_mcp.db import ADELAIDE_TZ
+from adelaide_metro_mcp.gtfs_loader import build_database
+from conftest import FIXTURE_DIR, make_zip
 
 
 def at(iso: str) -> datetime:
@@ -22,8 +25,7 @@ def at(iso: str) -> datetime:
 
 
 def trips(conn, stop_id, now, **kwargs):
-    _, deps = db.next_departures(conn, stop_id, now, **kwargs)
-    return [d.trip_id for d in deps]
+    return [d.trip_id for d in db.next_departures(conn, stop_id, now, **kwargs).departures]
 
 
 # --- active_services ------------------------------------------------------------
@@ -63,7 +65,7 @@ def test_departure_already_gone_is_not_listed(conn):
 
 def test_after_midnight_finds_previous_days_late_trip(conn):
     # Saturday 00:30: T4 is Friday's trip at 24:50, i.e. Saturday 00:50.
-    _, deps = db.next_departures(conn, "S1", at("2026-11-14T00:30"))
+    deps = db.next_departures(conn, "S1", at("2026-11-14T00:30")).departures
     assert [d.trip_id for d in deps] == ["T4"]
     assert deps[0].departs_at == at("2026-11-14T00:50")
 
@@ -102,9 +104,10 @@ def test_route_filter_by_number_is_case_insensitive(conn):
 
 
 def test_departure_fields(conn):
-    stop, deps = db.next_departures(conn, "S1", at("2026-11-13T23:30"))
-    assert stop.stop_name == "Central Station"
-    assert deps[0] == db.Departure(
+    board = db.next_departures(conn, "S1", at("2026-11-13T23:30"))
+    assert board.stop.stop_name == "Central Station"
+    assert board.to_stop is None
+    assert board.departures[0] == db.Departure(
         departs_at=at("2026-11-14T00:50"),
         route_short_name="T1",
         route_long_name="Central Station to Beach (tram)",
@@ -120,7 +123,7 @@ def test_now_in_another_timezone_is_converted_to_adelaide(conn):
     # Sun 21:35 UTC = Mon 08:05 in Adelaide (ACDT, +10:30). Monday's service
     # applies, and T1 (08:00) has already left. Using +9:30 would wrongly give T1.
     now = datetime(2026, 11, 8, 21, 35, tzinfo=timezone.utc)
-    _, deps = db.next_departures(conn, "S1", now)
+    deps = db.next_departures(conn, "S1", now).departures
     assert [d.trip_id for d in deps] == ["T2"]
     assert deps[0].departs_at.utcoffset() == timedelta(hours=10, minutes=30)
 
@@ -184,3 +187,90 @@ def test_timetable_info(conn):
     assert info.end_date == date(2027, 12, 31)
     assert info.loaded_at_utc  # set by the loader
     assert (info.stop_count, info.route_count, info.trip_count) == (3, 2, 5)
+
+
+def test_parent_station_has_no_departures_and_says_why(conn):
+    with pytest.raises(db.NotFoundError, match="station grouping"):
+        db.next_departures(conn, "P1", at("2026-11-09T07:00"))
+
+
+# --- next_departures with a destination (to_stop_id) ---------------------------------
+
+def trips_to(conn, stop_id, to_stop_id, now, **kwargs):
+    """[(trip_id, departs HH:MM, arrives HH:MM), ...]"""
+    board = db.next_departures(conn, stop_id, now, to_stop_id=to_stop_id, **kwargs)
+    assert board.to_stop.stop_id == to_stop_id
+    return [(d.trip_id, f"{d.departs_at:%H:%M}", f"{d.arrives_at:%H:%M}") for d in board.departures]
+
+
+def test_destination_filter_adds_arrival_times(conn):
+    assert trips_to(conn, "S1", "S3", at("2026-11-09T07:00")) == [
+        ("T5", "07:30", "08:00"),
+        ("T1", "08:00", "08:30"),
+        ("T2", "09:00", "09:30"),
+    ]
+
+
+def test_destination_must_allow_getting_off(conn):
+    # T2 is pickup-only at S2 (drop_off_type 1), so it can't take you *to* S2.
+    assert trips_to(conn, "S1", "S2", at("2026-11-09T07:00")) == [
+        ("T5", "07:30", "07:40"),
+        ("T1", "08:00", "08:10"),
+    ]
+
+
+def test_destination_skips_trips_that_do_not_go_there(conn):
+    # Saturday: T3 runs S1 -> S3 without stopping at S2.
+    assert trips_to(conn, "S1", "S3", at("2026-11-14T09:00")) == [("T3", "10:00", "10:30")]
+    assert trips_to(conn, "S1", "S2", at("2026-11-14T09:00")) == []  # none soon, but not an error
+
+
+def test_destination_after_midnight(conn):
+    assert trips_to(conn, "S1", "S3", at("2026-11-14T00:30")) == [("T4", "00:50", "01:10")]
+
+
+def test_destination_with_route_filter(conn):
+    assert trips_to(conn, "S1", "S3", at("2026-11-09T07:00"), route="100", limit=1) == [("T5", "07:30", "08:00")]
+
+
+def test_wrong_direction_is_a_clear_error(conn):
+    # Every trip runs S1 -> S2 -> S3, so nothing ever goes S2 -> S1.
+    with pytest.raises(db.NotFoundError, match="No trip goes directly from Market Street"):
+        db.next_departures(conn, "S2", at("2026-11-09T07:00"), to_stop_id="S1")
+
+
+def test_destination_same_as_origin_rejected(conn):
+    with pytest.raises(ValueError, match="different stop"):
+        db.next_departures(conn, "S1", at("2026-11-09T07:00"), to_stop_id="S1")
+
+
+@pytest.mark.parametrize("bad, error", [("NOPE", db.NotFoundError), ("P1", db.NotFoundError), ("S1;", ValueError)])
+def test_bad_destination_rejected(conn, bad, error):
+    with pytest.raises(error):
+        db.next_departures(conn, "S2", at("2026-11-09T07:00"), to_stop_id=bad)
+
+
+def test_loop_trip_uses_first_arrival_after_boarding(tmp_path):
+    # A loop trip TL visits S1 and S2 twice: S1 11:00, S2 11:10, S1 11:20, S2 11:30, S3 11:40.
+    src = tmp_path / "loop"
+    src.mkdir()
+    for f in FIXTURE_DIR.glob("*.txt"):
+        text = f.read_text(encoding="utf-8")
+        if not text.endswith("\n"):
+            text += "\n"
+        if f.name == "trips.txt":
+            text += "R100,WE,TL,Loop,,0,,,1\n"
+        if f.name == "stop_times.txt":
+            for seq, (time_, stop) in enumerate(
+                [("11:00", "S1"), ("11:10", "S2"), ("11:20", "S1"), ("11:30", "S2"), ("11:40", "S3")], start=1
+            ):
+                text += f"TL,{time_}:00,{time_}:00,{stop},{seq},,0,0,0,1,,\n"
+        (src / f.name).write_text(text, encoding="utf-8")
+    db_file = tmp_path / "loop.sqlite"
+    build_database(make_zip(src, tmp_path / "loop.zip"), db_file)
+
+    with closing(db.connect(db_file)) as c:
+        assert trips_to(c, "S1", "S2", at("2026-11-14T10:55")) == [
+            ("TL", "11:00", "11:10"),  # not 11:30: the first time it reaches S2
+            ("TL", "11:20", "11:30"),
+        ]

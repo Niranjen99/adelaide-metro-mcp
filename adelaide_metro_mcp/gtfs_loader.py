@@ -10,7 +10,7 @@ Design notes:
   36 MB and is skipped).
 - GTFS times can go past midnight ("25:10:00" = 1:10am on the next calendar
   day, still the same service day), so times are stored as seconds since
-  midnight of the service day, not as clock strings.
+  the start of the service day, not as clock strings.
 - The database is built in a temporary file and then swapped in, so a crash
   or bad download never leaves the server with a half-built database.
 """
@@ -46,6 +46,11 @@ HTTP_TIMEOUT_SECONDS = 60
 DB_FILENAME = "gtfs.sqlite"
 ZIP_FILENAME = "google_transit.zip"
 
+# Bump whenever SCHEMA_SQL or TABLES change. A database built with a different
+# schema version is rebuilt by update() even if the timetable version is the same,
+# and the server refuses to use it (instead of failing on a missing column).
+SCHEMA_VERSION = "2"  # 2: stop_times.drop_off_type
+
 _TIME_RE = re.compile(r"^(\d{1,3}):([0-5]\d):([0-5]\d)$")
 
 
@@ -63,7 +68,7 @@ def default_data_dir() -> Path:
 
 
 def time_to_seconds(value: str) -> int | None:
-    """Convert a GTFS time like "25:10:00" to seconds since service-day midnight.
+    """Convert a GTFS time like "25:10:00" to seconds since the start of the service day.
 
     Empty values are allowed by GTFS for non-timepoint stops and return None.
     """
@@ -129,6 +134,7 @@ TABLES: dict[str, tuple[str, list[tuple[str, str, bool, object]]]] = {
         ("arrival_secs", "arrival_time", True, time_to_seconds),
         ("departure_secs", "departure_time", True, time_to_seconds),
         ("pickup_type", "pickup_type", False, _int_or_none),
+        ("drop_off_type", "drop_off_type", False, _int_or_none),
     ]),
     "calendar": ("calendar.txt", [
         ("service_id", "service_id", True, _text),
@@ -165,7 +171,8 @@ CREATE TABLE trips (
 );
 CREATE TABLE stop_times (
     trip_id TEXT NOT NULL, stop_id TEXT NOT NULL, stop_sequence INTEGER NOT NULL,
-    arrival_secs INTEGER, departure_secs INTEGER, pickup_type INTEGER
+    arrival_secs INTEGER, departure_secs INTEGER, pickup_type INTEGER,
+    drop_off_type INTEGER
 );
 CREATE TABLE calendar (
     service_id TEXT PRIMARY KEY, monday INTEGER, tuesday INTEGER,
@@ -269,6 +276,7 @@ def build_database(zip_path: Path, db_path: Path, version: str | None = None) ->
             conn.executescript(INDEX_SQL)
             meta = {
                 "feed_version": version or feed_info.get("feed_version", ""),
+                "schema_version": SCHEMA_VERSION,
                 "feed_start_date": feed_info.get("feed_start_date", ""),
                 "feed_end_date": feed_info.get("feed_end_date", ""),
                 "loaded_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -285,33 +293,44 @@ def build_database(zip_path: Path, db_path: Path, version: str | None = None) ->
 
 
 def read_loaded_version(db_path: Path) -> str | None:
-    """Return the feed version stored in an existing database, or None."""
+    """Return the feed version stored in an existing database, or None.
+
+    Also None if the database was built with a different SCHEMA_VERSION, so
+    update() rebuilds it.
+    """
     if not Path(db_path).exists():
         return None
     try:
         # closing(): `with sqlite3.connect()` alone commits but does NOT close,
         # and Windows cannot replace a database file that is still open.
         with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
-            row = conn.execute("SELECT value FROM metadata WHERE key = 'feed_version'").fetchone()
+            meta = dict(conn.execute(
+                "SELECT key, value FROM metadata WHERE key IN ('feed_version', 'schema_version')"
+            ))
     except sqlite3.Error:
         return None
-    return row[0] if row else None
+    if meta.get("schema_version") != SCHEMA_VERSION:
+        return None
+    return meta.get("feed_version")
 
 
 # ---------------------------------------------------------------------------
 # Network (kept small and separate so tests can replace these two functions)
 # ---------------------------------------------------------------------------
 
+def _open_url(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS)
+
+
 def fetch_latest_version() -> str:
-    req = urllib.request.Request(VERSION_URL, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+    with _open_url(VERSION_URL) as resp:
         return resp.read().decode("utf-8").strip()
 
 
 def download_zip(dest: Path) -> None:
-    req = urllib.request.Request(STATIC_ZIP_URL, headers={"User-Agent": USER_AGENT})
     tmp = Path(dest).with_suffix(".part")
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp, open(tmp, "wb") as out:
+    with _open_url(STATIC_ZIP_URL) as resp, open(tmp, "wb") as out:
         shutil.copyfileobj(resp, out)
     if not zipfile.is_zipfile(tmp):
         tmp.unlink(missing_ok=True)

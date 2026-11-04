@@ -1,6 +1,8 @@
 """Shared pytest fixtures. Everything is built from local files: no network."""
 
+import sqlite3
 import zipfile
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,13 @@ def make_zip(src_dir: Path, dest: Path, skip: set[str] | None = None) -> Path:
             if f.name not in skip:
                 zf.write(f, f.name)
     return dest
+
+
+def set_schema_version(db_path: Path, value: str) -> None:
+    """Pretend a database was built by a different version of the loader."""
+    with closing(sqlite3.connect(db_path)) as c:
+        c.execute("UPDATE metadata SET value = ? WHERE key = 'schema_version'", (value,))
+        c.commit()
 
 
 @pytest.fixture

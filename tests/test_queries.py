@@ -1,8 +1,11 @@
 """Tests for db.py queries against the mini GTFS fixture."""
 
+import sqlite3
+
 import pytest
 
 from adelaide_metro_mcp import db
+from conftest import set_schema_version
 
 
 def ids(stops):
@@ -92,7 +95,25 @@ def test_missing_database_gives_helpful_error(tmp_path):
 
 
 def test_connection_is_read_only(conn):
-    import sqlite3
-
     with pytest.raises(sqlite3.OperationalError):
         conn.execute("DELETE FROM stops")
+
+
+# --- parent stations ------------------------------------------------------------
+# P1 "Central Station" is a parent station (location_type 1) grouping S1.
+
+def test_parent_station_is_not_a_boarding_stop(conn):
+    with pytest.raises(db.NotFoundError, match="station grouping"):
+        db.get_stop(conn, "P1")
+
+
+def test_find_stops_excludes_parent_stations(conn):
+    # By name, P1 and S1 are both "Central Station" and only S1 comes back
+    # (test_find_by_name_is_case_insensitive). By id, P1 must not match either.
+    assert db.find_stops(conn, "P1") == []
+
+
+def test_database_from_older_version_gives_helpful_error(gtfs_db):
+    set_schema_version(gtfs_db, "1")
+    with pytest.raises(db.DatabaseNotReadyError, match="older version"):
+        db.connect(gtfs_db)

@@ -14,7 +14,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from adelaide_metro_mcp.gtfs_loader import DB_FILENAME, default_data_dir
+from adelaide_metro_mcp.gtfs_loader import DB_FILENAME, SCHEMA_VERSION, default_data_dir
 
 # All GTFS times are local Adelaide time (agency_timezone in agency.txt).
 # ZoneInfo handles daylight saving (ACST +9:30 / ACDT +10:30).
@@ -38,8 +38,10 @@ MAX_QUERY_LENGTH = 100
 MAX_LIMIT = 20
 DEFAULT_MINUTES_AHEAD = 120
 MAX_MINUTES_AHEAD = 24 * 60
-_STOP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
-_ROUTE_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")  # stop ids and route names in the real feed fit this
+
+# A route can be given by its short name ("100", "GLNELG") or its route_id.
+_ROUTE_MATCH_SQL = "(r.route_short_name = ? COLLATE NOCASE OR r.route_id = ? COLLATE NOCASE)"
 
 
 class DatabaseNotReadyError(RuntimeError):
@@ -60,7 +62,7 @@ class Stop:
 
 @dataclass(frozen=True)
 class RouteSummary:
-    route_id: str
+    route_id: str  # not shown to users; service alerts (Phase 2) identify routes by route_id
     short_name: str
     long_name: str
     mode: str
@@ -74,6 +76,34 @@ class Departure:
     mode: str
     headsign: str
     trip_id: str
+    arrives_at: datetime | None = None  # at the destination, when to_stop_id is given
+
+
+@dataclass(frozen=True)
+class DepartureBoard:
+    stop: Stop
+    to_stop: Stop | None  # set when to_stop_id was given
+    departures: list[Departure]
+
+
+@dataclass(frozen=True)
+class TripStop:
+    stop: Stop
+    stop_sequence: int
+    time_secs: int | None  # arrival (or departure) time, seconds since the trip's service-day start
+    can_board: bool  # False when pickup_type is 1 (set down only)
+    can_alight: bool  # False when drop_off_type is 1 (pick up only)
+
+
+@dataclass(frozen=True)
+class TripStops:
+    trip_id: str
+    route_short_name: str
+    route_long_name: str
+    mode: str
+    headsign: str
+    from_stop: Stop | None  # set when from_stop_id was given
+    stops: list[TripStop]  # in travel order; the last one is the trip's final stop
 
 
 @dataclass(frozen=True)
@@ -101,17 +131,33 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
             "The timetable has not been downloaded yet. "
             "Run: python -m adelaide_metro_mcp.gtfs_loader"
         )
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        row = conn.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None or row[0] != SCHEMA_VERSION:
+        conn.close()
+        raise DatabaseNotReadyError(
+            "The timetable database was built by an older version of this server. "
+            "Rebuild it with: python -m adelaide_metro_mcp.gtfs_loader"
+        )
+    return conn
 
 
 # --- input validation ----------------------------------------------------------
 
+def _validate_int(value: int, name: str, low: int, high: int, hint: str = "") -> int:
+    # bool is a subclass of int in Python, so True would otherwise pass as 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a whole number")
+    if not low <= value <= high:
+        raise ValueError(f"{name} must be between {low} and {high}{hint}")
+    return value
+
+
 def validate_limit(limit: int) -> int:
-    if isinstance(limit, bool) or not isinstance(limit, int):
-        raise ValueError("limit must be a whole number")
-    if not 1 <= limit <= MAX_LIMIT:
-        raise ValueError(f"limit must be between 1 and {MAX_LIMIT}")
-    return limit
+    return _validate_int(limit, "limit", 1, MAX_LIMIT)
 
 
 def validate_query(query: str) -> str:
@@ -129,17 +175,22 @@ def validate_stop_id(stop_id: str) -> str:
     if not isinstance(stop_id, str):
         raise ValueError("stop_id must be text")
     stop_id = stop_id.strip()
-    if not _STOP_ID_RE.match(stop_id):
+    if not _ID_RE.match(stop_id):
         raise ValueError("stop_id must be 1-20 letters, digits, '-' or '_' (use the id from find_stops)")
     return stop_id
 
 
+def validate_trip_id(trip_id: str) -> str:
+    if not isinstance(trip_id, str):
+        raise ValueError("trip_id must be text")
+    trip_id = trip_id.strip()
+    if not _ID_RE.match(trip_id):
+        raise ValueError("trip_id must be 1-20 letters, digits, '-' or '_' (use the trip id from next_departures)")
+    return trip_id
+
+
 def validate_minutes_ahead(minutes: int) -> int:
-    if isinstance(minutes, bool) or not isinstance(minutes, int):
-        raise ValueError("minutes_ahead must be a whole number")
-    if not 1 <= minutes <= MAX_MINUTES_AHEAD:
-        raise ValueError(f"minutes_ahead must be between 1 and {MAX_MINUTES_AHEAD} (24 hours)")
-    return minutes
+    return _validate_int(minutes, "minutes_ahead", 1, MAX_MINUTES_AHEAD, " (24 hours)")
 
 
 def validate_route(route: str | None) -> str | None:
@@ -151,7 +202,7 @@ def validate_route(route: str | None) -> str | None:
     route = route.strip()
     if not route:
         return None
-    if not _ROUTE_RE.match(route):
+    if not _ID_RE.match(route):
         raise ValueError("route must be 1-20 letters, digits, '-' or '_', e.g. '100' or 'GLNELG'")
     return route
 
@@ -159,6 +210,10 @@ def validate_route(route: str | None) -> str | None:
 def _escape_like(term: str) -> str:
     """Make % and _ in user input match literally in a LIKE pattern."""
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _mode_name(route_type: int) -> str:
+    return ROUTE_TYPE_NAMES.get(route_type, f"Type {route_type}")
 
 
 # --- queries ---------------------------------------------------------------------
@@ -234,10 +289,7 @@ def routes_at_stop(conn: sqlite3.Connection, stop_id: str) -> tuple[Stop, list[R
         """,
         (stop.stop_id,),
     ).fetchall()
-    routes = [
-        RouteSummary(rid, short, long_, ROUTE_TYPE_NAMES.get(rtype, f"Type {rtype}"))
-        for rid, short, long_, rtype in rows
-    ]
+    routes = [RouteSummary(rid, short, long_, _mode_name(rtype)) for rid, short, long_, rtype in rows]
     routes.sort(key=_route_sort_key)
     return stop, routes
 
@@ -303,7 +355,8 @@ def next_departures(
     limit: int = 10,
     minutes_ahead: int = DEFAULT_MINUTES_AHEAD,
     route: str | None = None,
-) -> tuple[Stop, list[Departure]]:
+    to_stop_id: str | None = None,
+) -> DepartureBoard:
     """Scheduled departures from a stop between `now` and `now + minutes_ahead`.
 
     Timetable only (no live delays). A trip belongs to the service day it
@@ -315,6 +368,11 @@ def next_departures(
 
     Skipped: stops where you cannot board (pickup_type 1) and the last stop
     of each trip (the vehicle terminates there, so it is not a departure).
+
+    With to_stop_id, only trips that call at that stop later (and let
+    passengers off there, drop_off_type != 1) are kept, with their arrival
+    time. Direct trips only: no transfers. If a trip visits the destination
+    twice (loop routes), the first arrival after boarding is used.
     """
     stop = get_stop(conn, stop_id)
     limit = validate_limit(limit)
@@ -325,6 +383,11 @@ def next_departures(
 
     if route is not None:
         _check_route_serves_stop(conn, route, stop)
+    to_stop = None
+    if to_stop_id is not None:
+        to_stop = get_stop(conn, to_stop_id)
+        if to_stop.stop_id == stop.stop_id:
+            raise ValueError("to_stop_id must be a different stop from stop_id")
 
     window_end = now + timedelta(minutes=minutes_ahead)
     today = now.astimezone(ADELAIDE_TZ).date()
@@ -341,41 +404,85 @@ def next_departures(
             continue  # the window ends before this service day starts
 
         placeholders = ",".join("?" * len(services))
+        params: list[object] = []
+        if to_stop is not None:
+            # First arrival at the destination after boarding, or NULL if the trip never gets there.
+            arrival_sql = """(SELECT MIN(dst.arrival_secs) FROM stop_times dst
+                              WHERE dst.trip_id = st.trip_id AND dst.stop_id = ?
+                                AND dst.stop_sequence > st.stop_sequence
+                                AND IFNULL(dst.drop_off_type, 0) != 1)"""
+            params.append(to_stop.stop_id)
+        else:
+            arrival_sql = "NULL"
+        params += [stop.stop_id, lo, hi, *sorted(services)]
         route_sql = ""
-        params: list[object] = [stop.stop_id, lo, hi, *sorted(services)]
         if route is not None:
-            route_sql = "AND (r.route_short_name = ? COLLATE NOCASE OR r.route_id = ? COLLATE NOCASE)"
+            route_sql = f"AND {_ROUTE_MATCH_SQL}"
             params += [route, route]
+        reaches_sql = "WHERE arrival_secs IS NOT NULL" if to_stop is not None else ""
         params.append(limit)
 
         rows = conn.execute(
             f"""
-            SELECT st.departure_secs, IFNULL(r.route_short_name, ''), IFNULL(r.route_long_name, ''),
-                   r.route_type, IFNULL(t.trip_headsign, ''), t.trip_id
-            FROM stop_times st
-            JOIN trips t ON t.trip_id = st.trip_id
-            JOIN routes r ON r.route_id = t.route_id
-            WHERE st.stop_id = ?
-              AND st.departure_secs BETWEEN ? AND ?
-              AND IFNULL(st.pickup_type, 0) != 1
-              AND t.service_id IN ({placeholders})
-              {route_sql}
-              AND EXISTS (SELECT 1 FROM stop_times nxt
-                          WHERE nxt.trip_id = st.trip_id AND nxt.stop_sequence > st.stop_sequence)
-            ORDER BY st.departure_secs
+            SELECT * FROM (
+                SELECT st.departure_secs, IFNULL(r.route_short_name, ''), IFNULL(r.route_long_name, ''),
+                       r.route_type, IFNULL(t.trip_headsign, ''), t.trip_id,
+                       {arrival_sql} AS arrival_secs
+                FROM stop_times st
+                JOIN trips t ON t.trip_id = st.trip_id
+                JOIN routes r ON r.route_id = t.route_id
+                WHERE st.stop_id = ?
+                  AND st.departure_secs BETWEEN ? AND ?
+                  AND IFNULL(st.pickup_type, 0) != 1
+                  AND t.service_id IN ({placeholders})
+                  {route_sql}
+                  AND EXISTS (SELECT 1 FROM stop_times nxt
+                              WHERE nxt.trip_id = st.trip_id AND nxt.stop_sequence > st.stop_sequence)
+            )
+            {reaches_sql}
+            ORDER BY departure_secs
             LIMIT ?
             """,
             params,
         ).fetchall()
 
-        for secs, short, long_, rtype, headsign, trip_id in rows:
-            departs_at = (base + timedelta(seconds=secs)).astimezone(ADELAIDE_TZ)
-            departures.append(
-                Departure(departs_at, short, long_, ROUTE_TYPE_NAMES.get(rtype, f"Type {rtype}"), headsign, trip_id)
-            )
+        def local(secs: int) -> datetime:
+            return (base + timedelta(seconds=secs)).astimezone(ADELAIDE_TZ)
+
+        for secs, short, long_, rtype, headsign, trip_id, arr_secs in rows:
+            arrives_at = None if arr_secs is None else local(arr_secs)
+            departures.append(Departure(local(secs), short, long_, _mode_name(rtype), headsign, trip_id, arrives_at))
+
+    if to_stop is not None and not departures:
+        _check_direct_trip_exists(conn, stop, to_stop)
 
     departures.sort(key=lambda d: (d.departs_at, d.route_short_name, d.trip_id))
-    return stop, departures[:limit]
+    return DepartureBoard(stop, to_stop, departures[:limit])
+
+
+def _check_direct_trip_exists(conn: sqlite3.Connection, stop: Stop, to_stop: Stop) -> None:
+    """Called only when no trips were found: is it "none soon" or "never"?
+
+    "Never" (e.g. the wrong direction, or a transfer is needed) is an error,
+    so Claude looks for another stop instead of telling the user to wait.
+    """
+    found = conn.execute(
+        """
+        SELECT 1 FROM stop_times a
+        JOIN stop_times b ON b.trip_id = a.trip_id
+        WHERE a.stop_id = ? AND b.stop_id = ?
+          AND b.stop_sequence > a.stop_sequence
+          AND IFNULL(a.pickup_type, 0) != 1 AND IFNULL(b.drop_off_type, 0) != 1
+        LIMIT 1
+        """,
+        (stop.stop_id, to_stop.stop_id),
+    ).fetchone()
+    if found is None:
+        raise NotFoundError(
+            f"No trip goes directly from {stop.stop_name} (id {stop.stop_id}) to {to_stop.stop_name} "
+            f"(id {to_stop.stop_id}) at any time: check the direction of travel (the stop on the other "
+            "side of the road has a different id), or the journey needs a transfer."
+        )
 
 
 def _check_route_serves_stop(conn: sqlite3.Connection, route: str, stop: Stop) -> None:
@@ -384,15 +491,14 @@ def _check_route_serves_stop(conn: sqlite3.Connection, route: str, stop: Stop) -
     Without this, asking for a tram at a bus stop would answer "no departures
     in the next 2 hours", which wrongly suggests waiting longer would help.
     """
-    match = "(r.route_short_name = ? COLLATE NOCASE OR r.route_id = ? COLLATE NOCASE)"
-    if conn.execute(f"SELECT 1 FROM routes r WHERE {match}", (route, route)).fetchone() is None:
+    if conn.execute(f"SELECT 1 FROM routes r WHERE {_ROUTE_MATCH_SQL}", (route, route)).fetchone() is None:
         raise NotFoundError(f"No route {route!r}. Use routes_at_stop to see the routes at this stop.")
     serves = conn.execute(
         f"""
         SELECT 1 FROM stop_times st
         JOIN trips t ON t.trip_id = st.trip_id
         JOIN routes r ON r.route_id = t.route_id
-        WHERE st.stop_id = ? AND {match}
+        WHERE st.stop_id = ? AND {_ROUTE_MATCH_SQL}
         LIMIT 1
         """,
         (stop.stop_id, route, route),
@@ -402,6 +508,62 @@ def _check_route_serves_stop(conn: sqlite3.Connection, route: str, stop: Stop) -
             f"Route {route} does not stop at {stop.stop_name} (id {stop.stop_id}). "
             "Use routes_at_stop to see the routes that do."
         )
+
+
+def trip_stops(conn: sqlite3.Connection, trip_id: str, from_stop_id: str | None = None) -> TripStops:
+    """Every stop one trip calls at, in order, with its timetable time.
+
+    This answers "where does this bus go?", which next_departures cannot:
+    to_stop_id only checks a destination you already know. With
+    from_stop_id, only the stops after that one are returned (the part of
+    the trip you would ride). If a loop trip visits from_stop_id twice, the
+    first visit where you can board is used.
+    """
+    trip_id = validate_trip_id(trip_id)
+    from_stop = get_stop(conn, from_stop_id) if from_stop_id is not None else None
+
+    trip = conn.execute(
+        """
+        SELECT IFNULL(r.route_short_name, ''), IFNULL(r.route_long_name, ''), r.route_type,
+               IFNULL(t.trip_headsign, '')
+        FROM trips t JOIN routes r ON r.route_id = t.route_id
+        WHERE t.trip_id = ?
+        """,
+        (trip_id,),
+    ).fetchone()
+    if trip is None:
+        raise NotFoundError(f"No trip with id {trip_id!r}. Use next_departures to get a trip id.")
+    short, long_, rtype, headsign = trip
+
+    rows = conn.execute(
+        """
+        SELECT s.stop_id, IFNULL(s.stop_code, ''), s.stop_name, IFNULL(s.stop_desc, ''),
+               st.stop_sequence, IFNULL(st.arrival_secs, st.departure_secs),
+               IFNULL(st.pickup_type, 0) != 1, IFNULL(st.drop_off_type, 0) != 1
+        FROM stop_times st JOIN stops s ON s.stop_id = st.stop_id
+        WHERE st.trip_id = ?
+        ORDER BY st.stop_sequence
+        """,
+        (trip_id,),
+    ).fetchall()
+    stops = [
+        TripStop(Stop(sid, code, name, desc), seq, secs, bool(board), bool(alight))
+        for sid, code, name, desc, seq, secs, board, alight in rows
+    ]
+
+    if from_stop is not None:
+        start = next(
+            (i for i, ts in enumerate(stops) if ts.stop.stop_id == from_stop.stop_id and ts.can_board),
+            None,
+        )
+        if start is None:
+            raise NotFoundError(
+                f"Trip {trip_id} does not pick up at {from_stop.stop_name} (id {from_stop.stop_id}). "
+                "Use the trip id from next_departures for this stop."
+            )
+        stops = stops[start + 1:]
+
+    return TripStops(trip_id, short, long_, _mode_name(rtype), headsign, from_stop, stops)
 
 
 def timetable_info(conn: sqlite3.Connection) -> TimetableInfo:

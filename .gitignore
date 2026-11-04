@@ -17,3 +17,26 @@ notes/
 
 # Visual Studio workspace files
 .vs/
+
+# Claude Code progress notes (local only)
+CLAUDE.md
+.claude/
+
+# Python build, test and tool caches
+build/
+dist/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store

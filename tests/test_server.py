@@ -5,11 +5,14 @@ directly, so these tests exercise the full MCP request/response path quickly.
 """
 
 import asyncio
+from datetime import datetime
 
 import pytest
 
 from mcp import Client
 
+from adelaide_metro_mcp import server
+from adelaide_metro_mcp.db import ADELAIDE_TZ
 from adelaide_metro_mcp.server import mcp
 
 
@@ -35,7 +38,7 @@ def text(result) -> str:
 
 def test_tools_are_listed_and_read_only():
     tools = {t.name: t for t in list_tools()}
-    assert set(tools) == {"find_stops", "routes_at_stop", "next_departures", "timetable_info"}
+    assert set(tools) == {"find_stops", "routes_at_stop", "next_departures", "trip_stops", "timetable_info"}
     for t in tools.values():
         assert t.description, f"{t.name} needs a description"
         assert t.annotations.read_only_hint is True
@@ -99,12 +102,6 @@ def test_missing_database_tells_user_how_to_fix(monkeypatch, tmp_path):
 
 # --- next_departures and timetable_info -------------------------------------------------
 
-from datetime import datetime
-
-from adelaide_metro_mcp import server
-from adelaide_metro_mcp.db import ADELAIDE_TZ
-
-
 @pytest.fixture
 def clock(monkeypatch):
     """Set the server's 'now' to a fixed Adelaide time: clock('2026-11-09T07:00')."""
@@ -121,15 +118,15 @@ def test_next_departures_returns_readable_text(server_data, clock):
     assert text(result) == (
         "Scheduled departures from Central Station (stop 10001, id S1) - 1 Test Rd, Testville\n"
         "As of Mon 09 Nov 07:00 (timetable only, no live delays):\n"
-        "- 07:30  Bus 100 to Beach Interchange (in 30 min)\n"
-        "- 08:00  Bus 100 to Beach Interchange (in 1 h)"
+        "- 07:30  Bus 100 to Beach Interchange (in 30 min), trip T5\n"
+        "- 08:00  Bus 100 to Beach Interchange (in 1 h), trip T1"
     )
 
 
 def test_next_departures_after_midnight_shows_tomorrow(server_data, clock):
     clock("2026-11-13T23:30")  # Friday night
     result = call("next_departures", {"stop_id": "S1"})
-    assert text(result).endswith("- 00:50 tomorrow  Tram T1 to Beach (in 1 h 20 min)")
+    assert text(result).endswith("- 00:50 tomorrow  Tram T1 to Beach (in 1 h 20 min), trip T4")
 
 
 def test_next_departures_route_filter(server_data, clock):
@@ -177,3 +174,100 @@ def test_timetable_info_text(server_data, clock):
 def test_timetable_info_warns_when_expired(server_data, clock):
     clock("2028-01-10T07:00")
     assert "this timetable has expired" in text(call("timetable_info", {}))
+
+
+def test_parent_station_error_points_to_find_stops(server_data):
+    result = call("routes_at_stop", {"stop_id": "P1"})
+    assert result.is_error
+    assert "Use find_stops to pick a specific platform" in text(result)
+
+
+# --- next_departures with to_stop_id ----------------------------------------------------
+
+def test_next_departures_to_destination_text(server_data, clock):
+    clock("2026-11-09T07:00")
+    result = call("next_departures", {"stop_id": "S1", "to_stop_id": "S3", "limit": 1})
+    assert not result.is_error
+    assert text(result) == (
+        "Scheduled direct trips from Central Station (stop 10001, id S1) - 1 Test Rd, Testville "
+        "to Beach Interchange (stop 10003, id S3) - 5 Shore Rd, Seaside\n"
+        "As of Mon 09 Nov 07:00 (timetable only, no live delays):\n"
+        "- 07:30  Bus 100 to Beach Interchange (in 30 min), arrives 08:00 (30 min ride), trip T5"
+    )
+
+
+def test_next_departures_to_destination_none_soon(server_data, clock):
+    clock("2026-11-14T09:00")  # Saturday: the only trip skips S2
+    result = call("next_departures", {"stop_id": "S1", "to_stop_id": "S2"})
+    assert not result.is_error
+    assert text(result).startswith("No scheduled direct trips from Central Station")
+
+
+def test_next_departures_wrong_direction_is_a_clear_error(server_data, clock):
+    clock("2026-11-09T07:00")
+    result = call("next_departures", {"stop_id": "S2", "to_stop_id": "S1"})
+    assert result.is_error
+    assert "No trip goes directly" in text(result)
+    assert "direction of travel" in text(result)
+
+
+# --- trip_stops -------------------------------------------------------------------------
+
+def test_trip_stops_from_boarding_stop_text(server_data):
+    result = call("trip_stops", {"trip_id": "T1", "from_stop_id": "S1"})
+    assert not result.is_error
+    assert text(result).splitlines() == [
+        "Bus 100 to Beach Interchange (trip T1)",
+        "Stops after Central Station (stop 10001, id S1) - 1 Test Rd, Testville, timetable times:",
+        "- 08:10  Market Street - Stop 5 (stop 10002, id S2) - 20 Market St, Testville",
+        "- 08:30  Beach Interchange (stop 10003, id S3) - 5 Shore Rd, Seaside (last stop)",
+    ]
+
+
+def test_trip_stops_marks_restricted_stops(server_data):
+    t2 = text(call("trip_stops", {"trip_id": "T2"}))
+    assert "id S2) - 20 Market St, Testville (pick up only)" in t2
+    t5 = text(call("trip_stops", {"trip_id": "T5"}))
+    assert "id S2) - 20 Market St, Testville (set down only)" in t5
+
+
+def test_trip_stops_after_midnight_shows_clock_time(server_data):
+    lines = text(call("trip_stops", {"trip_id": "T4"})).splitlines()
+    assert lines[0] == "Tram T1 to Beach (trip T4)"
+    # The whole trip runs after midnight, so neither stop is marked "(next day)".
+    assert lines[2].startswith("- 00:50  Central Station")
+    assert lines[3].startswith("- 01:10  Beach Interchange")
+
+
+@pytest.mark.parametrize(
+    "secs, first, expected",
+    [
+        (8 * 3600 + 5 * 60, 8 * 3600, "08:05"),
+        (24 * 3600 + 10 * 60, 23 * 3600 + 50 * 60, "00:10 (next day)"),  # crosses midnight
+        (25 * 3600, 24 * 3600 + 50 * 60, "01:00"),  # started after midnight: no marker
+        (None, 0, "--:--"),
+    ],
+)
+def test_format_trip_time(secs, first, expected):
+    assert server._format_trip_time(secs, first) == expected
+
+
+def test_trip_stops_from_last_stop_says_so(server_data):
+    result = call("trip_stops", {"trip_id": "T1", "from_stop_id": "S3"})
+    assert text(result).endswith("- none: this is the trip's last stop")
+
+
+def test_trip_stops_unknown_trip_is_a_clear_error(server_data):
+    result = call("trip_stops", {"trip_id": "NOPE"})
+    assert result.is_error
+    assert "No trip with id 'NOPE'" in text(result)
+
+
+def test_departure_trip_id_works_with_trip_stops(server_data, clock):
+    # The intended flow: take the trip id from next_departures and pass it to trip_stops.
+    clock("2026-11-09T07:00")
+    first_line = text(call("next_departures", {"stop_id": "S1", "limit": 1})).splitlines()[2]
+    trip_id = first_line.rsplit("trip ", 1)[1]
+    result = call("trip_stops", {"trip_id": trip_id, "from_stop_id": "S1"})
+    assert not result.is_error
+    assert "Beach Interchange (stop 10003, id S3)" in text(result)

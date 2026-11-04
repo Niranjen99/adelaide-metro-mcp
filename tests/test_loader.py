@@ -14,7 +14,7 @@ from adelaide_metro_mcp.gtfs_loader import (
     read_loaded_version,
     time_to_seconds,
 )
-from conftest import FIXTURE_DIR, make_zip
+from conftest import FIXTURE_DIR, make_zip, set_schema_version
 
 
 def query(db: Path, sql: str, *params):
@@ -49,7 +49,7 @@ def test_time_to_seconds_rejects_bad_values(bad):
 def test_build_loads_expected_row_counts(tmp_path, gtfs_zip):
     counts = build_database(gtfs_zip, tmp_path / "gtfs.sqlite")
     assert counts == {
-        "stops": 3,
+        "stops": 4,  # 3 boarding stops + parent station P1
         "routes": 2,
         "trips": 5,
         "stop_times": 13,
@@ -97,7 +97,7 @@ def test_utf8_bom_in_header_is_handled(tmp_path):
             data = b"\xef\xbb\xbf" + data
         (src / f.name).write_bytes(data)
     counts = build_database(make_zip(src, tmp_path / "g.zip"), tmp_path / "g.sqlite")
-    assert counts["stops"] == 3
+    assert counts["stops"] == 4
 
 
 # --- bad input --------------------------------------------------------------
@@ -175,3 +175,28 @@ def test_update_force_always_downloads(tmp_path, fake_network):
     gtfs_loader.update(tmp_path)
     gtfs_loader.update(tmp_path, force=True)
     assert fake_network["downloads"] == 2
+
+
+# --- schema version: rebuild databases made by an older version of the loader --------
+
+def test_schema_version_is_stored(gtfs_db):
+    meta = dict(query(gtfs_db, "SELECT key, value FROM metadata"))
+    assert meta["schema_version"] == gtfs_loader.SCHEMA_VERSION
+
+
+def test_drop_off_type_is_loaded(gtfs_db):
+    rows = query(gtfs_db, "SELECT drop_off_type FROM stop_times WHERE trip_id='T2' AND stop_id='S2'")
+    assert rows == [(1,)]
+
+
+def test_old_schema_counts_as_not_loaded(gtfs_db):
+    set_schema_version(gtfs_db, "1")
+    assert read_loaded_version(gtfs_db) is None
+
+
+def test_update_rebuilds_old_schema_even_if_timetable_unchanged(tmp_path, fake_network):
+    gtfs_loader.update(tmp_path)
+    set_schema_version(tmp_path / "gtfs.sqlite", "1")
+    gtfs_loader.update(tmp_path)
+    assert fake_network["downloads"] == 2
+    assert read_loaded_version(tmp_path / "gtfs.sqlite") == "1714"

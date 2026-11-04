@@ -31,6 +31,11 @@ mcp = MCPServer(
     instructions=(
         "Answers questions about Adelaide Metro buses, trains and trams using official "
         "GTFS timetable data. To get departures, first call find_stops to get a stop_id. "
+        "For 'how do I get from A to B', find stops near both places and call next_departures "
+        "with to_stop_id to see which services go there directly and when they arrive. "
+        "If no stop near B is known, or no trip goes there directly, call next_departures "
+        "without to_stop_id, then trip_stops with a trip id and from_stop_id to see where that "
+        "service goes, and pick the stop nearest B. "
         f"Data source: {ATTRIBUTION}."
     ),
 )
@@ -94,6 +99,10 @@ def _now() -> datetime:
     return datetime.now(db.ADELAIDE_TZ)
 
 
+def _day_suffix(when: datetime, now: datetime) -> str:
+    return "" if when.date() == now.date() else " tomorrow"
+
+
 def _format_departure(d: db.Departure, now: datetime) -> str:
     minutes = int((d.departs_at - now).total_seconds() // 60)
     if minutes <= 0:
@@ -103,9 +112,12 @@ def _format_departure(d: db.Departure, now: datetime) -> str:
     else:
         hours, mins = divmod(minutes, 60)
         when = f"in {hours} h" if mins == 0 else f"in {hours} h {mins} min"
-    day = "" if d.departs_at.date() == now.date() else " tomorrow"
     destination = d.headsign or d.route_long_name
-    return f"- {d.departs_at:%H:%M}{day}  {d.mode} {d.route_short_name} to {destination} ({when})"
+    line = f"- {d.departs_at:%H:%M}{_day_suffix(d.departs_at, now)}  {d.mode} {d.route_short_name} to {destination} ({when})"
+    if d.arrives_at is not None:
+        ride = int((d.arrives_at - d.departs_at).total_seconds() // 60)
+        line += f", arrives {d.arrives_at:%H:%M}{_day_suffix(d.arrives_at, now)} ({ride} min ride)"
+    return f"{line}, trip {d.trip_id}"
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -119,23 +131,92 @@ def next_departures(
     route: Annotated[
         str | None, Field(description="Only this route, e.g. '100' or 'GLNELG' (Glenelg tram). Omit for all routes.")
     ] = None,
+    to_stop_id: Annotated[
+        str | None,
+        Field(
+            description="Optional destination stop id from find_stops. Only trips that stop there later "
+            "are listed, with their arrival time. Direct trips only (no transfers)."
+        ),
+    ] = None,
 ) -> str:
     """Upcoming scheduled departures from a stop, in Adelaide local time.
 
     Based on the published timetable only: it does not include live delays or
     cancellations. Covers the next `minutes_ahead` minutes (default 2 hours).
+    To answer "how do I get from A to B", pass the destination as to_stop_id:
+    the result shows which buses go there directly and when each one arrives.
     """
     now = _now()
-    stop, deps = _run(lambda conn: db.next_departures(conn, stop_id, now, limit, minutes_ahead, route))
+    board = _run(lambda conn: db.next_departures(conn, stop_id, now, limit, minutes_ahead, route, to_stop_id))
+
+    kind = "direct trips" if board.to_stop else "departures"
     route_text = f" for route {route.strip()}" if route and route.strip() else ""
-    window = f"{minutes_ahead} minutes" if minutes_ahead < 120 else f"{minutes_ahead / 60:g} hours"
-    if not deps:
-        return f"No scheduled departures{route_text} from {_format_stop(stop)} in the next {window}."
+    to_text = f" to {_format_stop(board.to_stop)}" if board.to_stop else ""
+    trip_text = f"{kind}{route_text} from {_format_stop(board.stop)}{to_text}"
+    if not board.departures:
+        window = f"{minutes_ahead} minutes" if minutes_ahead < 120 else f"{minutes_ahead / 60:g} hours"
+        return f"No scheduled {trip_text} in the next {window}."
     lines = [
-        f"Scheduled departures{route_text} from {_format_stop(stop)}",
+        f"Scheduled {trip_text}",
         f"As of {now:%a %d %b %H:%M} (timetable only, no live delays):",
     ]
-    lines += [_format_departure(d, now) for d in deps]
+    lines += [_format_departure(d, now) for d in board.departures]
+    return "\n".join(lines)
+
+
+def _format_trip_time(secs: int | None, first_secs: int | None) -> str:
+    """HH:MM clock time; '(next day)' when the trip has crossed midnight since the first listed stop.
+
+    GTFS times count from the trip's service day and can pass 24:00
+    (25:10 = 01:10 next morning). Comparing with the first listed stop means a
+    trip that starts after midnight is not marked, but one that crosses it is.
+    """
+    if secs is None:
+        return "--:--"
+    hours, rem = divmod(secs, 3600)
+    clock = f"{hours % 24:02d}:{rem // 60:02d}"
+    if first_secs is not None and secs // 86400 > first_secs // 86400:
+        clock += " (next day)"
+    return clock
+
+
+@mcp.tool(annotations=READ_ONLY)
+def trip_stops(
+    trip_id: Annotated[str, Field(description="Trip id from a next_departures result (the 'trip ...' at the end of a line).")],
+    from_stop_id: Annotated[
+        str | None,
+        Field(description="Optional stop id where the rider boards. Only the stops after it are listed."),
+    ] = None,
+) -> str:
+    """Every stop a trip calls at, in order, with scheduled times (Adelaide local time).
+
+    Use it to find where a bus, train or tram goes and which stop to get off at
+    when you don't know the destination stop id. Timetable only, no live delays.
+    """
+    trip = _run(lambda conn: db.trip_stops(conn, trip_id, from_stop_id))
+    destination = trip.headsign or trip.route_long_name
+    lines = [f"{trip.mode} {trip.route_short_name} to {destination} (trip {trip.trip_id})"]
+    if trip.from_stop is not None:
+        lines.append(f"Stops after {_format_stop(trip.from_stop)}, timetable times:")
+    else:
+        lines.append("All stops, timetable times:")
+    if not trip.stops:
+        lines.append("- none: this is the trip's last stop")
+        return "\n".join(lines)
+
+    first_secs = trip.stops[0].time_secs
+    for i, ts in enumerate(trip.stops):
+        notes = []
+        if not ts.can_alight and ts.can_board:
+            notes.append("pick up only")
+        elif not ts.can_board and ts.can_alight:
+            notes.append("set down only")
+        elif not ts.can_board and not ts.can_alight:
+            notes.append("does not stop for passengers")
+        if i == len(trip.stops) - 1:
+            notes.append("last stop")
+        note = f" ({', '.join(notes)})" if notes else ""
+        lines.append(f"- {_format_trip_time(ts.time_secs, first_secs)}  {_format_stop(ts.stop)}{note}")
     return "\n".join(lines)
 
 
