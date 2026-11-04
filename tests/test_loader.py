@@ -51,8 +51,8 @@ def test_build_loads_expected_row_counts(tmp_path, gtfs_zip):
     assert counts == {
         "stops": 3,
         "routes": 2,
-        "trips": 4,
-        "stop_times": 10,
+        "trips": 5,
+        "stop_times": 13,
         "calendar": 2,
         "calendar_dates": 2,
     }

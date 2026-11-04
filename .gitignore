@@ -11,3 +11,9 @@ data/
 
 # Secrets
 .env
+
+# Personal study notes (not part of the project)
+notes/
+
+# Visual Studio workspace files
+.vs/

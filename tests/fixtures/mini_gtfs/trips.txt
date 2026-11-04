@@ -3,3 +3,4 @@ R100,WK,T1,Beach Interchange,,0,,,1
 R100,WK,T2,Beach Interchange,,0,,,1
 R100,WE,T3,Beach Interchange,,0,,,1
 RT1,WK,T4,Beach,,0,,,1
+R100,WK,T5,Beach Interchange,,0,,,1
