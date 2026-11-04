@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "mcp[cli]>=2.3,<3",
+    "pydantic>=2.12",
 ]
 
 [project.optional-dependencies]

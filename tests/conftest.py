@@ -32,3 +32,20 @@ def gtfs_db(tmp_path: Path, gtfs_zip: Path) -> Path:
     db_path = tmp_path / "gtfs.sqlite"
     build_database(gtfs_zip, db_path)
     return db_path
+
+
+@pytest.fixture
+def conn(gtfs_db: Path):
+    """An open read-only connection to the fixture database."""
+    from adelaide_metro_mcp import db
+
+    c = db.connect(gtfs_db)
+    yield c
+    c.close()
+
+
+@pytest.fixture
+def server_data(monkeypatch, gtfs_db: Path) -> Path:
+    """Point the MCP server at the fixture database (via its env variable)."""
+    monkeypatch.setenv("ADELAIDE_METRO_DATA_DIR", str(gtfs_db.parent))
+    return gtfs_db
