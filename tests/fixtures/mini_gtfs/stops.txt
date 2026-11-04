@@ -1,0 +1,4 @@
+stop_id,stop_code,stop_name,stop_desc,stop_lat,stop_lon,zone_id,stop_url,location_type,parent_station,stop_timezone,wheelchair_boarding
+S1,10001,Central Station,"1 Test Rd, Testville",-34.9200,138.6000,,,,,,1
+S2,10002,Market Street - Stop 5,"20 Market St, Testville",-34.9300,138.6100,,,,,,
+S3,10003,Beach Interchange,"5 Shore Rd, Seaside",-34.9800,138.5100,,,,,,1

@@ -1,0 +1,3 @@
+route_id,agency_id,route_short_name,route_long_name,route_desc,route_type,route_url,route_color,route_text_color,RouteGroup
+R100,1,100,Central Station to Beach Interchange,"via Market St",3,,243E8C,ffffff,100
+RT1,1,T1,Central Station to Beach (tram),,0,,FF0000,ffffff,T1
