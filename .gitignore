@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Downloaded GTFS data and the SQLite database built from it (re-creatable)
+data/
+
+# Secrets
+.env
