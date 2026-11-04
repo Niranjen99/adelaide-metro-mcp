@@ -54,8 +54,8 @@ def test_find_stops_returns_readable_text(server_data):
     result = call("find_stops", {"query": "central"})
     assert not result.is_error
     assert text(result) == (
-        "Found 1 stop(s) for 'central':\n"
-        "- Central Station (stop 10001, id S1) - 1 Test Rd, Testville"
+        "Found 1 stop(s) matching 'central':\n"
+        "- Central Station (stop 10001, id S1) - 1 Test Rd, Testville; towards Beach Interchange, Beach"
     )
 
 
@@ -271,3 +271,32 @@ def test_departure_trip_id_works_with_trip_stops(server_data, clock):
     result = call("trip_stops", {"trip_id": trip_id, "from_stop_id": "S1"})
     assert not result.is_error
     assert "Beach Interchange (stop 10003, id S3)" in text(result)
+
+
+# --- find_stops near / towards, trip_stops max_stops ------------------------------------
+
+def test_find_stops_near_text(server_data):
+    result = call("find_stops", {"near_stop_id": "S1", "radius_m": 2000})
+    assert not result.is_error
+    lines = text(result).splitlines()
+    assert lines[0] == "Found 2 stop(s) within 2000 m of stop id S1:"
+    assert lines[1].endswith("Testville, 0 m away; towards Beach Interchange, Beach")
+    assert "m away; towards Beach Interchange" in lines[2]
+
+
+def test_find_stops_shows_where_trips_end(server_data):
+    assert text(call("find_stops", {"query": "Seaside"})).endswith("; no departures (trips end here)")
+
+
+def test_find_stops_without_query_or_near_is_a_clear_error(server_data):
+    result = call("find_stops", {})
+    assert result.is_error
+    assert "query, a near_stop_id, or both" in text(result)
+
+
+def test_trip_stops_max_stops_names_the_last_stop(server_data):
+    lines = text(call("trip_stops", {"trip_id": "T1", "max_stops": 1})).splitlines()
+    assert lines[2] == "- 08:00  Central Station (stop 10001, id S1) - 1 Test Rd, Testville"
+    assert lines[3] == (
+        "... 2 more stop(s), ending at Beach Interchange (id S3) at 08:30. Ask with a bigger max_stops to see them."
+    )

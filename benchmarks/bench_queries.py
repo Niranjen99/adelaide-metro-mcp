@@ -98,7 +98,7 @@ def bench_queries(conn, busiest: str, runs: int) -> list[tuple[str, dict[str, fl
     cases = iter(random_cases * 2)  # enough for warm-up + timed runs
     destination = downstream_stop(conn, busiest)
     long_trip = longest_trip(conn)
-    n_stops = len(db.trip_stops(conn, long_trip).stops)
+    n_stops = len(db.trip_stops(conn, long_trip, max_stops=db.MAX_MAX_STOPS).stops)
 
     def random_stop_departures():
         stop_id, now = next(cases)
@@ -106,12 +106,14 @@ def bench_queries(conn, busiest: str, runs: int) -> list[tuple[str, dict[str, fl
 
     return [
         ("find_stops('king william')", measure(lambda: db.find_stops(conn, "king william"), runs)),
+        ("find_stops near_stop_id (busiest stop, 400 m)", measure(lambda: db.find_stops(conn, near_stop_id=busiest), runs)),
         (f"routes_at_stop (busiest stop, id {busiest})", measure(lambda: db.routes_at_stop(conn, busiest), runs)),
         ("next_departures (busiest stop, Wed 08:00)", measure(lambda: db.next_departures(conn, busiest, peak), runs)),
         ("next_departures (random stop and time)", measure(random_stop_departures, runs)),
         ("next_departures with to_stop_id (busiest stop, Wed 08:00)",
          measure(lambda: db.next_departures(conn, busiest, peak, to_stop_id=destination), runs)),
-        (f"trip_stops (longest trip, {n_stops} stops)", measure(lambda: db.trip_stops(conn, long_trip), runs)),
+        (f"trip_stops (longest trip, all {n_stops} stops)",
+         measure(lambda: db.trip_stops(conn, long_trip, max_stops=db.MAX_MAX_STOPS), runs)),
     ]
 
 

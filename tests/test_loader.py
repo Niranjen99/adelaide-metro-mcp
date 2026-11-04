@@ -200,3 +200,13 @@ def test_update_rebuilds_old_schema_even_if_timetable_unchanged(tmp_path, fake_n
     gtfs_loader.update(tmp_path)
     assert fake_network["downloads"] == 2
     assert read_loaded_version(tmp_path / "gtfs.sqlite") == "1714"
+
+
+def test_stop_headsigns_are_precomputed(gtfs_db):
+    rows = query(gtfs_db, "SELECT stop_id, headsign, trips FROM stop_headsigns ORDER BY stop_id, trips DESC")
+    # Boardable, not-last-stop calls only: T5 is set-down only at S2, and S3 ends every trip.
+    assert rows == [
+        ("S1", "Beach Interchange", 4),
+        ("S1", "Beach", 1),
+        ("S2", "Beach Interchange", 2),
+    ]

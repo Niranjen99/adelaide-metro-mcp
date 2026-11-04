@@ -12,10 +12,10 @@ An MCP server that lets Claude (or any MCP client) answer Adelaide Metro questio
 
 | Tool | Example question | What it returns |
 |---|---|---|
-| `find_stops` | "Find stops on King William St" | Matching stops with the stop number from the sign and the address |
+| `find_stops` | "Find stops on King William St" / "What's across the road from this stop?" | Matching stops (by text, or within a radius of another stop) with the stop number, address and where its buses head ("towards City, West Lakes") |
 | `routes_at_stop` | "Which routes stop at City South?" | Every bus, train and tram route that calls there |
 | `next_departures` | "When's the next bus from stop D2?" / "Which buses go from Sefton Park to King William St?" | Scheduled departures in the next 2 hours (adjustable), optionally for one route or only trips that go directly to a destination stop, with arrival times |
-| `trip_stops` | "Where does this bus go? Where do I get off for Hindley St?" | Every stop one trip calls at after your stop, in order, with times, marking the last stop and stops where you can't get off |
+| `trip_stops` | "Where does this bus go? Where do I get off for Hindley St?" | The stops one trip calls at after your stop (25 by default, the final stop always named), in order, with times, marking stops where you can't get off |
 | `timetable_info` | "How current is your timetable?" | Timetable version, dates it's valid for, size |
 
 All tools are read-only and validate their inputs. Departures come from the **published timetable only**. Live delays and service disruptions are planned (see [Roadmap](#roadmap)).
@@ -111,15 +111,16 @@ Results on a Windows 11 desktop (AMD64, Python 3.12.10), timetable version 1714,
 
 | Query | Median (ms) | p95 (ms) |
 |---|---:|---:|
-| `find_stops("king william")` | 2.66 | 2.83 |
-| `routes_at_stop` (busiest stop) | 1.93 | 2.05 |
-| `next_departures` (busiest stop, weekday 08:00) | 0.69 | 0.72 |
-| `next_departures` (random stop and time) | 0.66 | 0.91 |
-| `next_departures` with `to_stop_id` (busiest stop, weekday 08:00) | 1.34 | 1.42 |
-| `trip_stops` (longest trip, 177 stops) | 0.68 | 0.74 |
-| `next_departures` through the MCP client, end to end | 1.93 | 2.35 |
+| `find_stops("king william")` | 3.04 | 3.79 |
+| `find_stops` with `near_stop_id` (busiest stop, 400 m) | 1.18 | 1.46 |
+| `routes_at_stop` (busiest stop) | 2.00 | 2.53 |
+| `next_departures` (busiest stop, weekday 08:00) | 0.71 | 0.83 |
+| `next_departures` (random stop and time) | 0.71 | 1.00 |
+| `next_departures` with `to_stop_id` (busiest stop, weekday 08:00) | 1.41 | 1.95 |
+| `trip_stops` (longest trip, all 177 stops) | 0.76 | 0.99 |
+| `next_departures` through the MCP client, end to end | 2.39 | 3.30 |
 
-Full database build from the 15 MB zip: 7.3 s.
+Full database build from the 15 MB zip: 9.0 s.
 
 ## Engineering decisions
 
@@ -129,6 +130,10 @@ Full database build from the 15 MB zip: 7.3 s.
 - **Only real departures.** Stops where you can't board (`pickup_type = 1`, 4,378 in the feed) and the last stop of each trip are excluded. Parent stations, which group platforms, are rejected with a message pointing to a platform.
 - **A to B as an option, not a new tool.** `next_departures` takes an optional `to_stop_id` instead of adding a new tool: fewer tools with clear jobs make it easier for the model to pick the right one. It keeps trips that reach the destination later and let you off there (`drop_off_type != 1`, 3,607 pickup-only stops in the feed). For loop routes that visit a stop twice (552 trips), it uses the first arrival after you board. If nothing ever goes directly, the tool says so (wrong side of the road, or a transfer is needed), so Claude doesn't tell the user to wait. Direct trips only: this is not a journey planner.
 - **A separate tool for "where does this bus go?".** `to_stop_id` only checks a destination Claude already knows. In a real test ("Sefton Park to Hindley St"), Claude guessed six city stops one by one and none were on the route: the buses run down King William St to Victoria Sq. `trip_stops` lists a trip's stops in `stop_sequence` order, so one call shows the stop to get off at. It works per trip, not per route, because one route has several stopping patterns (express variants, short runs), and the trip being caught gives the exact stops and times. `next_departures` prints each trip id so Claude can pass it on. It uses the existing `stop_times(trip_id)` index, so no schema change was needed.
+- **Fewer model round trips.** The database answers in about 1-3 ms; the slow part of a conversation is the model taking turns between tool calls. Early tests needed 7-10 calls per question, mostly searching: the stop on the other side of the road had a different suburb in its address (so text search missed it), and Claude had to call `next_departures` on every stop to see which way it went. Three changes target this:
+  - `find_stops(near_stop_id=...)` finds stops within a radius (default 400 m), using a cheap latitude/longitude box in SQL and then exact haversine distances in Python for the few candidates. Distances are straight-line between stop coordinates from `stops.txt`, not walking routes, and the tool description says so, so Claude doesn't present them as walking times. This also fixed a wrong answer: without distances, Claude picked R1 North Tce for the University of Adelaide by its address; the near search shows B1 Pulteney St is closer (122 m vs 264 m from the University tram stop).
+  - Each stop shows `towards ...`: the two most common headsigns of trips departing from it. That's too slow per request (up to 80 ms for a busy stop), so the loader precomputes a `stop_headsigns` table at build time (+1.7 s per build, 28k rows).
+  - `trip_stops` lists 25 stops by default and always names the final stop, instead of 70+ lines for a cross-city route.
 - **Schema versioning.** The database stores a schema version. If a newer release changes the tables, the loader rebuilds even when the timetable hasn't changed, and the server asks for a rebuild instead of failing on a missing column.
 - **Fast reads.** The 15 MB zip becomes a 55 MB SQLite database with an index on `(stop_id, departure_secs)`, so a departures lookup is a short index range scan.
 - **Safe updates.** The loader skips the download if `version.txt` is unchanged. It builds the database in a temporary file and swaps it in atomically, so a failed download never leaves a half-built database.

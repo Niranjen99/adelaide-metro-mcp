@@ -31,6 +31,9 @@ mcp = MCPServer(
     instructions=(
         "Answers questions about Adelaide Metro buses, trains and trams using official "
         "GTFS timetable data. To get departures, first call find_stops to get a stop_id. "
+        "Each stop shows 'towards' (where its trips go): use it to pick the side of the road "
+        "going the right way. If the right side isn't listed, call find_stops with near_stop_id "
+        "set to a stop you found; addresses on the two sides can name different suburbs. "
         "For 'how do I get from A to B', find stops near both places and call next_departures "
         "with to_stop_id to see which services go there directly and when they arrive. "
         "If no stop near B is known, or no trip goes there directly, call next_departures "
@@ -65,20 +68,49 @@ def _format_stop(s: db.Stop) -> str:
 
 @mcp.tool(annotations=READ_ONLY)
 def find_stops(
-    query: Annotated[str, Field(description="Stop name, street, suburb or stop number, e.g. 'Glenelg' or 'King William D2'.")],
+    query: Annotated[
+        str | None,
+        Field(description="Stop name, street, suburb or stop number, e.g. 'Glenelg' or 'King William D2'."),
+    ] = None,
     limit: Limit = 10,
+    near_stop_id: Annotated[
+        str | None,
+        Field(
+            description="Optional stop id: only stops within radius_m of it, nearest first. Use it to find "
+            "the stop on the other side of the road, or other stops nearby. Distances are straight-line "
+            "between stops, not walking routes."
+        ),
+    ] = None,
+    radius_m: Annotated[
+        int,
+        Field(ge=db.MIN_RADIUS_M, le=db.MAX_RADIUS_M, description="Search radius for near_stop_id, in metres. Default 400."),
+    ] = db.DEFAULT_RADIUS_M,
 ) -> str:
-    """Search Adelaide Metro stops by name, street, suburb or the stop number shown on the sign.
+    """Search Adelaide Metro stops by name, street, suburb or stop number, or near another stop.
 
-    Returns each stop's name, stop number, id and address. Use the id with
-    next_departures or routes_at_stop.
+    Give a query, a near_stop_id, or both. Returns each stop's name, stop
+    number, id, address and 'towards' (where most departing trips go, which
+    tells the two sides of a road apart). Use the id with next_departures.
     """
-    stops = _run(lambda conn: db.find_stops(conn, query, limit))
+    stops = _run(lambda conn: db.find_stops(conn, query, limit, near_stop_id, radius_m))
+    what = ""
+    if query is not None:
+        what += f" matching {query.strip()!r}"
+    if near_stop_id is not None:
+        what += f" within {radius_m} m of stop id {near_stop_id.strip()}"
     if not stops:
-        return f"No stops found for {query.strip()!r}. Try a shorter name or a street name."
-    lines = [f"Found {len(stops)} stop(s) for {query.strip()!r}:"]
-    lines += [f"- {_format_stop(s)}" for s in stops]
+        return f"No stops found{what}. Try a shorter name, a street name or a bigger radius."
+    lines = [f"Found {len(stops)} stop(s){what}:"]
+    lines += [f"- {_format_found_stop(s)}" for s in stops]
     return "\n".join(lines)
+
+
+def _format_found_stop(s: db.Stop) -> str:
+    line = _format_stop(s)
+    if s.distance_m is not None:
+        line += f", {s.distance_m} m away"
+    line += f"; towards {', '.join(s.towards)}" if s.towards else "; no departures (trips end here)"
+    return line
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -187,13 +219,17 @@ def trip_stops(
         str | None,
         Field(description="Optional stop id where the rider boards. Only the stops after it are listed."),
     ] = None,
+    max_stops: Annotated[
+        int,
+        Field(ge=1, le=db.MAX_MAX_STOPS, description="Maximum stops to list (1-200). Default 25; the last stop is always named."),
+    ] = db.DEFAULT_MAX_STOPS,
 ) -> str:
     """Every stop a trip calls at, in order, with scheduled times (Adelaide local time).
 
     Use it to find where a bus, train or tram goes and which stop to get off at
     when you don't know the destination stop id. Timetable only, no live delays.
     """
-    trip = _run(lambda conn: db.trip_stops(conn, trip_id, from_stop_id))
+    trip = _run(lambda conn: db.trip_stops(conn, trip_id, from_stop_id, max_stops))
     destination = trip.headsign or trip.route_long_name
     lines = [f"{trip.mode} {trip.route_short_name} to {destination} (trip {trip.trip_id})"]
     if trip.from_stop is not None:
@@ -213,10 +249,16 @@ def trip_stops(
             notes.append("set down only")
         elif not ts.can_board and not ts.can_alight:
             notes.append("does not stop for passengers")
-        if i == len(trip.stops) - 1:
+        if i == len(trip.stops) - 1 and not trip.more_stops:
             notes.append("last stop")
         note = f" ({', '.join(notes)})" if notes else ""
         lines.append(f"- {_format_trip_time(ts.time_secs, first_secs)}  {_format_stop(ts.stop)}{note}")
+    if trip.more_stops:
+        last = trip.last_stop
+        lines.append(
+            f"... {trip.more_stops} more stop(s), ending at {last.stop.stop_name} (id {last.stop.stop_id}) "
+            f"at {_format_trip_time(last.time_secs, first_secs)}. Ask with a bigger max_stops to see them."
+        )
     return "\n".join(lines)
 
 

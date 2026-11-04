@@ -78,3 +78,21 @@ def test_bad_trip_id_rejected(conn, bad):
 
 def test_trip_id_is_trimmed(conn):
     assert ids(db.trip_stops(conn, "  T1 ")) == ["S1", "S2", "S3"]
+
+
+def test_max_stops_cuts_the_list_but_keeps_the_last_stop(conn):
+    trip = db.trip_stops(conn, "T1", max_stops=1)
+    assert ids(trip) == ["S1"]
+    assert trip.more_stops == 2
+    assert trip.last_stop.stop.stop_id == "S3"
+
+
+def test_no_cut_when_trip_fits(conn):
+    trip = db.trip_stops(conn, "T1", max_stops=3)
+    assert (trip.more_stops, trip.last_stop) == (0, None)
+
+
+@pytest.mark.parametrize("bad", [0, 201, True])
+def test_bad_max_stops_rejected(conn, bad):
+    with pytest.raises(ValueError, match="max_stops"):
+        db.trip_stops(conn, "T1", max_stops=bad)

@@ -7,9 +7,10 @@ formatting for humans happens in server.py.
 
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,6 +39,13 @@ MAX_QUERY_LENGTH = 100
 MAX_LIMIT = 20
 DEFAULT_MINUTES_AHEAD = 120
 MAX_MINUTES_AHEAD = 24 * 60
+DEFAULT_RADIUS_M = 400  # about a 5-minute walk
+MIN_RADIUS_M, MAX_RADIUS_M = 50, 2000
+DEFAULT_MAX_STOPS = 25
+MAX_MAX_STOPS = 200  # the longest real trip has 177 stops
+TOWARDS_SHOWN = 2  # headsigns listed per stop in find_stops
+_EARTH_RADIUS_M = 6_371_000
+_METRES_PER_DEGREE_LAT = 111_320
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")  # stop ids and route names in the real feed fit this
 
 # A route can be given by its short name ("100", "GLNELG") or its route_id.
@@ -58,6 +66,8 @@ class Stop:
     stop_code: str
     stop_name: str
     stop_desc: str
+    towards: tuple[str, ...] = ()  # main headsigns of departing trips (find_stops only)
+    distance_m: int | None = None  # from the near_stop_id stop (find_stops only)
 
 
 @dataclass(frozen=True)
@@ -103,7 +113,9 @@ class TripStops:
     mode: str
     headsign: str
     from_stop: Stop | None  # set when from_stop_id was given
-    stops: list[TripStop]  # in travel order; the last one is the trip's final stop
+    stops: list[TripStop]  # in travel order, at most max_stops
+    more_stops: int = 0  # stops left out after the max_stops cut
+    last_stop: TripStop | None = None  # the trip's final stop, when it was cut off
 
 
 @dataclass(frozen=True)
@@ -158,6 +170,14 @@ def _validate_int(value: int, name: str, low: int, high: int, hint: str = "") ->
 
 def validate_limit(limit: int) -> int:
     return _validate_int(limit, "limit", 1, MAX_LIMIT)
+
+
+def validate_radius(radius_m: int) -> int:
+    return _validate_int(radius_m, "radius_m", MIN_RADIUS_M, MAX_RADIUS_M, " metres")
+
+
+def validate_max_stops(max_stops: int) -> int:
+    return _validate_int(max_stops, "max_stops", 1, MAX_MAX_STOPS)
 
 
 def validate_query(query: str) -> str:
@@ -218,43 +238,127 @@ def _mode_name(route_type: int) -> str:
 
 # --- queries ---------------------------------------------------------------------
 
-def find_stops(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[Stop]:
-    """Find boarding stops by name, street/description, or stop number.
+def find_stops(
+    conn: sqlite3.Connection,
+    query: str | None = None,
+    limit: int = 10,
+    near_stop_id: str | None = None,
+    radius_m: int = DEFAULT_RADIUS_M,
+) -> list[Stop]:
+    """Find boarding stops by text, by distance from another stop, or both.
 
-    Every word in the query must appear in the stop name or description,
+    Text: every word in the query must appear in the stop name or description,
     in any order, case-insensitive. So "king william d2" finds
     "Stop D2 King William St - East side". A query that exactly matches a
     stop number (the code printed on the stop sign) is listed first.
+
+    near_stop_id: only stops within radius_m metres of that stop, nearest
+    first (the stop itself is included, at 0 m). This finds the stop on the
+    other side of the road even when its address names a different suburb.
+
+    Each stop comes with `towards`: where most trips departing from it are
+    headed, so the right direction can be picked without more calls.
     Parent stations (location_type 1) are excluded: they have no departures.
     """
-    query = validate_query(query)
+    if query is None and near_stop_id is None:
+        raise ValueError("give a query, a near_stop_id, or both")
     limit = validate_limit(limit)
+    radius_m = validate_radius(radius_m)
+    query = validate_query(query) if query is not None else None
 
-    words = query.split()
-    conditions = []
+    where = ["IFNULL(location_type, 0) = 0"]
     params: list[object] = []
-    for w in words:
-        conditions.append(
-            "(stop_name LIKE ? ESCAPE '\\' OR IFNULL(stop_desc, '') LIKE ? ESCAPE '\\')"
-        )
-        pattern = f"%{_escape_like(w)}%"
-        params += [pattern, pattern]
+    if query is not None:
+        words = []
+        for w in query.split():
+            words.append("(stop_name LIKE ? ESCAPE '\\' OR IFNULL(stop_desc, '') LIKE ? ESCAPE '\\')")
+            pattern = f"%{_escape_like(w)}%"
+            params += [pattern, pattern]
+        where.append(f"(stop_code = ? OR stop_id = ? OR ({' AND '.join(words)}))")
+        params = [query, query, *params]
 
-    sql = f"""
-        SELECT stop_id, IFNULL(stop_code, ''), stop_name, IFNULL(stop_desc, '')
-        FROM stops
-        WHERE IFNULL(location_type, 0) = 0
-          AND (stop_code = ? OR stop_id = ? OR ({' AND '.join(conditions)}))
-        ORDER BY
-          CASE WHEN stop_code = ? OR stop_id = ? THEN 0
-               WHEN stop_name LIKE ? ESCAPE '\\' THEN 1
-               ELSE 2 END,
-          stop_name, stop_code
-        LIMIT ?
+    if near_stop_id is None:
+        starts_with = f"{_escape_like(query)}%"
+        rows = conn.execute(
+            f"""
+            SELECT {_STOP_COLUMNS} FROM stops
+            WHERE {' AND '.join(where)}
+            ORDER BY
+              CASE WHEN stop_code = ? OR stop_id = ? THEN 0
+                   WHEN stop_name LIKE ? ESCAPE '\\' THEN 1
+                   ELSE 2 END,
+              stop_name, stop_code
+            LIMIT ?
+            """,
+            [*params, query, query, starts_with, limit],
+        ).fetchall()
+        stops = [Stop(*row) for row in rows]
+    else:
+        stops = _stops_near(conn, near_stop_id, radius_m, where, params)[:limit]
+
+    return _with_towards(conn, stops)
+
+
+_STOP_COLUMNS = "stop_id, IFNULL(stop_code, ''), stop_name, IFNULL(stop_desc, '')"
+
+
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle (haversine) distance in metres."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * _EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def _stops_near(
+    conn: sqlite3.Connection, near_stop_id: str, radius_m: int, where: list[str], params: list[object]
+) -> list[Stop]:
+    """Stops within radius_m of a stop (plus any text conditions), nearest first.
+
+    SQL first narrows the search to a lat/lon box around the stop (cheap
+    comparisons), then exact distances are computed in Python for the few
+    stops inside the box, and the box corners are dropped.
     """
-    starts_with = f"{_escape_like(query)}%"
-    all_params = [query, query, *params, query, query, starts_with, limit]
-    return [Stop(*row) for row in conn.execute(sql, all_params)]
+    centre = get_stop(conn, near_stop_id)
+    lat, lon = conn.execute(
+        "SELECT stop_lat, stop_lon FROM stops WHERE stop_id = ?", (centre.stop_id,)
+    ).fetchone()
+    if lat is None or lon is None:
+        raise NotFoundError(f"{centre.stop_name} (id {centre.stop_id}) has no location in the timetable.")
+    dlat = radius_m / _METRES_PER_DEGREE_LAT
+    dlon = radius_m / (_METRES_PER_DEGREE_LAT * math.cos(math.radians(lat)))
+    rows = conn.execute(
+        f"""
+        SELECT {_STOP_COLUMNS}, stop_lat, stop_lon FROM stops
+        WHERE {' AND '.join(where)}
+          AND stop_lat BETWEEN ? AND ? AND stop_lon BETWEEN ? AND ?
+        """,
+        [*params, lat - dlat, lat + dlat, lon - dlon, lon + dlon],
+    ).fetchall()
+    found = []
+    for *cols, s_lat, s_lon in rows:
+        d = _distance_m(lat, lon, s_lat, s_lon)
+        if d <= radius_m:
+            found.append(Stop(*cols, distance_m=round(d)))
+    found.sort(key=lambda st: (st.distance_m, st.stop_name, st.stop_id))
+    return found
+
+
+def _with_towards(conn: sqlite3.Connection, stops: list[Stop]) -> list[Stop]:
+    """Attach each stop's main headsigns from the precomputed stop_headsigns table."""
+    if not stops:
+        return stops
+    placeholders = ",".join("?" * len(stops))
+    towards: dict[str, list[str]] = {}
+    for stop_id, headsign in conn.execute(
+        f"SELECT stop_id, headsign FROM stop_headsigns WHERE stop_id IN ({placeholders}) "
+        "ORDER BY stop_id, trips DESC, headsign",
+        [st.stop_id for st in stops],
+    ):
+        heads = towards.setdefault(stop_id, [])
+        if headsign and len(heads) < TOWARDS_SHOWN:
+            heads.append(headsign)
+    return [replace(st, towards=tuple(towards.get(st.stop_id, ()))) for st in stops]
 
 
 def get_stop(conn: sqlite3.Connection, stop_id: str) -> Stop:
@@ -510,7 +614,12 @@ def _check_route_serves_stop(conn: sqlite3.Connection, route: str, stop: Stop) -
         )
 
 
-def trip_stops(conn: sqlite3.Connection, trip_id: str, from_stop_id: str | None = None) -> TripStops:
+def trip_stops(
+    conn: sqlite3.Connection,
+    trip_id: str,
+    from_stop_id: str | None = None,
+    max_stops: int = DEFAULT_MAX_STOPS,
+) -> TripStops:
     """Every stop one trip calls at, in order, with its timetable time.
 
     This answers "where does this bus go?", which next_departures cannot:
@@ -518,8 +627,13 @@ def trip_stops(conn: sqlite3.Connection, trip_id: str, from_stop_id: str | None 
     from_stop_id, only the stops after that one are returned (the part of
     the trip you would ride). If a loop trip visits from_stop_id twice, the
     first visit where you can board is used.
+
+    At most max_stops are listed. If the trip goes further, the number left
+    out and the final stop are returned too, so the client still knows where
+    it ends and can ask again with a bigger max_stops.
     """
     trip_id = validate_trip_id(trip_id)
+    max_stops = validate_max_stops(max_stops)
     from_stop = get_stop(conn, from_stop_id) if from_stop_id is not None else None
 
     trip = conn.execute(
@@ -563,7 +677,11 @@ def trip_stops(conn: sqlite3.Connection, trip_id: str, from_stop_id: str | None 
             )
         stops = stops[start + 1:]
 
-    return TripStops(trip_id, short, long_, _mode_name(rtype), headsign, from_stop, stops)
+    more, last = 0, None
+    if len(stops) > max_stops:
+        more, last = len(stops) - max_stops, stops[-1]
+        stops = stops[:max_stops]
+    return TripStops(trip_id, short, long_, _mode_name(rtype), headsign, from_stop, stops, more, last)
 
 
 def timetable_info(conn: sqlite3.Connection) -> TimetableInfo:

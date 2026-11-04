@@ -49,7 +49,7 @@ ZIP_FILENAME = "google_transit.zip"
 # Bump whenever SCHEMA_SQL or TABLES change. A database built with a different
 # schema version is rebuilt by update() even if the timetable version is the same,
 # and the server refuses to use it (instead of failing on a missing column).
-SCHEMA_VERSION = "2"  # 2: stop_times.drop_off_type
+SCHEMA_VERSION = "3"  # 2: stop_times.drop_off_type; 3: stop_headsigns table
 
 _TIME_RE = re.compile(r"^(\d{1,3}):([0-5]\d):([0-5]\d)$")
 
@@ -194,6 +194,29 @@ CREATE INDEX idx_stops_code ON stops (stop_code);
 CREATE INDEX idx_calendar_dates_date ON calendar_dates (date);
 """
 
+# Derived data, built once after loading (too slow to compute per request: up to
+# 80 ms per busy stop). For each stop: where its departing trips are headed, and
+# how many trips go there. find_stops shows the top two as "towards ...", so the
+# client can tell the two sides of a road apart without calling next_departures.
+# Same rules as a departure: you can board (pickup_type != 1) and it is not the
+# trip's last stop.
+DERIVED_SQL = """
+CREATE TABLE stop_headsigns AS
+WITH last_stop AS (
+    SELECT trip_id, MAX(stop_sequence) AS last_seq FROM stop_times GROUP BY trip_id
+)
+SELECT st.stop_id,
+       COALESCE(NULLIF(t.trip_headsign, ''), r.route_long_name, '') AS headsign,
+       COUNT(*) AS trips
+FROM stop_times st
+JOIN last_stop l ON l.trip_id = st.trip_id AND st.stop_sequence < l.last_seq
+JOIN trips t ON t.trip_id = st.trip_id
+JOIN routes r ON r.route_id = t.route_id
+WHERE IFNULL(st.pickup_type, 0) != 1
+GROUP BY st.stop_id, headsign;
+CREATE INDEX idx_stop_headsigns_stop ON stop_headsigns (stop_id, trips DESC);
+"""
+
 BATCH_SIZE = 50_000
 
 
@@ -274,6 +297,7 @@ def build_database(zip_path: Path, db_path: Path, version: str | None = None) ->
                     log.info("Loaded %s: %d rows", table, counts[table])
                 feed_info = _read_feed_info(zf)
             conn.executescript(INDEX_SQL)
+            conn.executescript(DERIVED_SQL)
             meta = {
                 "feed_version": version or feed_info.get("feed_version", ""),
                 "schema_version": SCHEMA_VERSION,
