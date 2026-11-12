@@ -354,12 +354,16 @@ def fetch_latest_version() -> str:
 
 def download_zip(dest: Path) -> None:
     tmp = Path(dest).with_suffix(".part")
-    with _open_url(STATIC_ZIP_URL) as resp, open(tmp, "wb") as out:
-        shutil.copyfileobj(resp, out)
-    if not zipfile.is_zipfile(tmp):
+    try:
+        with _open_url(STATIC_ZIP_URL) as resp, open(tmp, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        if not zipfile.is_zipfile(tmp):
+            raise GTFSFormatError("Downloaded file is not a valid zip")
+        os.replace(tmp, dest)
+    finally:
+        # After a successful replace the .part file is gone; after a dropped
+        # connection or a bad zip this removes the partial download.
         tmp.unlink(missing_ok=True)
-        raise GTFSFormatError("Downloaded file is not a valid zip")
-    os.replace(tmp, dest)
 
 
 def update(data_dir: Path | None = None, force: bool = False) -> str:

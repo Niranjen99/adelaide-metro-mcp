@@ -11,7 +11,7 @@ nothing in this server may print() to stdout. Use logging (stderr) instead.
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import datetime
+from datetime import date, datetime
 from typing import Annotated
 
 from pydantic import Field
@@ -179,7 +179,12 @@ def next_departures(
     the result shows which buses go there directly and when each one arrives.
     """
     now = _now()
-    board = _run(lambda conn: db.next_departures(conn, stop_id, now, limit, minutes_ahead, route, to_stop_id))
+    board, (feed_start, feed_end) = _run(
+        lambda conn: (
+            db.next_departures(conn, stop_id, now, limit, minutes_ahead, route, to_stop_id),
+            db.feed_dates(conn),
+        )
+    )
 
     kind = "direct trips" if board.to_stop else "departures"
     route_text = f" for route {route.strip()}" if route and route.strip() else ""
@@ -187,13 +192,27 @@ def next_departures(
     trip_text = f"{kind}{route_text} from {_format_stop(board.stop)}{to_text}"
     if not board.departures:
         window = f"{minutes_ahead} minutes" if minutes_ahead < 120 else f"{minutes_ahead / 60:g} hours"
-        return f"No scheduled {trip_text} in the next {window}."
-    lines = [
-        f"Scheduled {trip_text}",
-        f"As of {now:%a %d %b %H:%M} (timetable only, no live delays):",
-    ]
-    lines += [_format_departure(d, now) for d in board.departures]
+        lines = [f"No scheduled {trip_text} in the next {window}."]
+    else:
+        lines = [
+            f"Scheduled {trip_text}",
+            f"As of {now:%a %d %b %H:%M} (timetable only, no live delays):",
+        ]
+        lines += [_format_departure(d, now) for d in board.departures]
+    # Without this, an expired timetable just answers "no departures", which reads as "none soon".
+    note = _validity_note(feed_start, feed_end, now.date())
+    if note:
+        lines.append(note)
     return "\n".join(lines)
+
+
+def _validity_note(start: date | None, end: date | None, today: date) -> str | None:
+    """A warning line when today is outside the dates the loaded timetable covers."""
+    if end and today > end:
+        return "Warning: this timetable has expired. Run: python -m adelaide_metro_mcp.gtfs_loader"
+    if start and today < start:
+        return "Note: this timetable has not started yet; departures for today may be missing."
+    return None
 
 
 def _format_trip_time(secs: int | None, first_secs: int | None) -> str:
@@ -273,10 +292,9 @@ def timetable_info() -> str:
         f"Downloaded {info.loaded_at_utc or 'unknown'} (UTC)",
         f"{info.stop_count} stops, {info.route_count} routes, {info.trip_count} trips",
     ]
-    if info.end_date and today > info.end_date:
-        lines.append("Warning: this timetable has expired. Run: python -m adelaide_metro_mcp.gtfs_loader")
-    elif info.start_date and today < info.start_date:
-        lines.append("Note: this timetable has not started yet; departures for today may be missing.")
+    note = _validity_note(info.start_date, info.end_date, today)
+    if note:
+        lines.append(note)
     lines.append(f"Data source: {ATTRIBUTION}")
     return "\n".join(lines)
 

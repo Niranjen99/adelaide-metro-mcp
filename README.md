@@ -156,7 +156,8 @@ tests/
 
 ## Roadmap
 
-- Journeys with a transfer, and "stops near here" using the stop coordinates (so Claude can pick the closest stop to a street).
+- Journeys with a transfer.
+- Stops near a street address or a place (today `find_stops` can only search near another stop).
 - Live delays in `next_departures` from the GTFS-Realtime trip updates feed (cached for its 60 s refresh interval).
 - `service_disruptions` tool from the GTFS-Realtime service alerts feed.
 

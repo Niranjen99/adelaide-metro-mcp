@@ -146,6 +146,19 @@ def test_next_departures_none_message(server_data, clock):
     assert "in the next 30 minutes" in text(result)
 
 
+def test_next_departures_warns_when_timetable_expired(server_data, clock):
+    clock("2028-01-10T07:00")  # the fixture timetable ends 2027-12-31
+    result = call("next_departures", {"stop_id": "S1"})
+    assert not result.is_error
+    assert "No scheduled departures" in text(result)
+    assert text(result).endswith("Warning: this timetable has expired. Run: python -m adelaide_metro_mcp.gtfs_loader")
+
+
+def test_next_departures_notes_when_timetable_not_started(server_data, clock):
+    clock("2025-12-01T07:00")  # the fixture timetable starts 2026-01-01
+    assert "this timetable has not started yet" in text(call("next_departures", {"stop_id": "S1"}))
+
+
 def test_next_departures_unknown_route_is_a_clear_error(server_data, clock):
     clock("2026-11-09T07:00")
     result = call("next_departures", {"stop_id": "S1", "route": "999"})

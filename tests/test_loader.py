@@ -104,7 +104,7 @@ def test_utf8_bom_in_header_is_handled(tmp_path):
 
 def test_missing_required_file_raises(tmp_path):
     z = make_zip(FIXTURE_DIR, tmp_path / "g.zip", skip={"stop_times.txt"})
-    with pytest.raises(GTFSFormatError, match="stop_times.txt"):
+    with pytest.raises(GTFSFormatError, match=r"stop_times\.txt"):
         build_database(z, tmp_path / "g.sqlite")
 
 

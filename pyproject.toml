@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "adelaide-metro-mcp"
 version = "0.1.0"
-description = "MCP server that answers Adelaide Metro stop, departure and disruption questions from official GTFS data."
+description = "MCP server that answers Adelaide Metro stop, route and departure questions from the official GTFS timetable."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

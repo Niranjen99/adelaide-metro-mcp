@@ -48,6 +48,9 @@ _EARTH_RADIUS_M = 6_371_000
 _METRES_PER_DEGREE_LAT = 111_320
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")  # stop ids and route names in the real feed fit this
 
+# The stops columns that make up a Stop, in field order.
+_STOP_COLUMNS = "stop_id, IFNULL(stop_code, ''), stop_name, IFNULL(stop_desc, '')"
+
 # A route can be given by its short name ("100", "GLNELG") or its route_id.
 _ROUTE_MATCH_SQL = "(r.route_short_name = ? COLLATE NOCASE OR r.route_id = ? COLLATE NOCASE)"
 
@@ -299,9 +302,6 @@ def find_stops(
     return _with_towards(conn, stops)
 
 
-_STOP_COLUMNS = "stop_id, IFNULL(stop_code, ''), stop_name, IFNULL(stop_desc, '')"
-
-
 def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle (haversine) distance in metres."""
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -365,8 +365,7 @@ def get_stop(conn: sqlite3.Connection, stop_id: str) -> Stop:
     """Return one boarding stop, or raise NotFoundError."""
     stop_id = validate_stop_id(stop_id)
     row = conn.execute(
-        "SELECT stop_id, IFNULL(stop_code, ''), stop_name, IFNULL(stop_desc, ''), "
-        "IFNULL(location_type, 0) FROM stops WHERE stop_id = ?",
+        f"SELECT {_STOP_COLUMNS}, IFNULL(location_type, 0) FROM stops WHERE stop_id = ?",
         (stop_id,),
     ).fetchone()
     if row is None:
@@ -450,6 +449,11 @@ def service_day_start(service_day: date) -> datetime:
     """
     noon = datetime.combine(service_day, time(12), tzinfo=ADELAIDE_TZ)
     return noon.astimezone(timezone.utc) - timedelta(hours=12)
+
+
+def _local_time(base: datetime, secs: int) -> datetime:
+    """A GTFS time (seconds since the service-day start `base`) as Adelaide local time."""
+    return (base + timedelta(seconds=secs)).astimezone(ADELAIDE_TZ)
 
 
 def next_departures(
@@ -550,12 +554,10 @@ def next_departures(
             params,
         ).fetchall()
 
-        def local(secs: int) -> datetime:
-            return (base + timedelta(seconds=secs)).astimezone(ADELAIDE_TZ)
-
         for secs, short, long_, rtype, headsign, trip_id, arr_secs in rows:
-            arrives_at = None if arr_secs is None else local(arr_secs)
-            departures.append(Departure(local(secs), short, long_, _mode_name(rtype), headsign, trip_id, arrives_at))
+            departs_at = _local_time(base, secs)
+            arrives_at = None if arr_secs is None else _local_time(base, arr_secs)
+            departures.append(Departure(departs_at, short, long_, _mode_name(rtype), headsign, trip_id, arrives_at))
 
     if to_stop is not None and not departures:
         _check_direct_trip_exists(conn, stop, to_stop)
@@ -682,6 +684,14 @@ def trip_stops(
         more, last = len(stops) - max_stops, stops[-1]
         stops = stops[:max_stops]
     return TripStops(trip_id, short, long_, _mode_name(rtype), headsign, from_stop, stops, more, last)
+
+
+def feed_dates(conn: sqlite3.Connection) -> tuple[date | None, date | None]:
+    """The first and last dates the loaded timetable covers (None when the feed does not say)."""
+    meta = dict(conn.execute(
+        "SELECT key, value FROM metadata WHERE key IN ('feed_start_date', 'feed_end_date')"
+    ))
+    return _parse_gtfs_date(meta.get("feed_start_date")), _parse_gtfs_date(meta.get("feed_end_date"))
 
 
 def timetable_info(conn: sqlite3.Connection) -> TimetableInfo:
